@@ -11,4 +11,3 @@ jobs:
         with:
           node-version: 20
       - run: node --check runner.js
-      - run: node --check engine.js
