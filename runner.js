@@ -98,6 +98,22 @@ async function installNetworkCapture(page) {
   const MAX = 2000000;
   window.__purrcatNetwork = captured;
 
+  const OriginalWebSocket = window.WebSocket;
+  window.WebSocket = function(url, protocols) {
+    const ws = protocols === undefined ? new OriginalWebSocket(url) : new OriginalWebSocket(url, protocols);
+    try {
+      ws.addEventListener('message', (event) => {
+        if (typeof event.data === 'string') save(String(url), 101, event.data);
+      });
+    } catch {}
+    return ws;
+  };
+  window.WebSocket.prototype = OriginalWebSocket.prototype;
+  window.WebSocket.OPEN = OriginalWebSocket.OPEN;
+  window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
+  window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
+  window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+
   function save(url, status, text) {
     try {
       if (!text || text.length > MAX) return;
@@ -133,14 +149,14 @@ async function installNetworkCapture(page) {
   });
 }
 
-async function discoverAndStartDirectMiner(page, address) {
-  return page.evaluate(async (address) => {
-    const captured = window.__purrcatNetwork || [];
+async function discoverAndStartDirectMiner(page, address, externalCaptured = []) {
+  return page.evaluate(async ({ address, externalCaptured }) => {
+    const captured = [...(window.__purrcatNetwork || []), ...(externalCaptured || [])];
     const candidates = [];
 
     function walk(v) {
       if (!v || typeof v !== 'object' || candidates.length > 50) return;
-      if (v.anchorHash && v.nonceHigh && v.targetHi !== undefined && v.targetLo !== undefined) {
+      if (v.anchorHash && v.nonceHigh && (v.targetHi !== undefined || v.targetLo !== undefined || v.target !== undefined)) {
         candidates.push(v);
       }
       if (Array.isArray(v)) for (const x of v) walk(x);
@@ -197,7 +213,7 @@ async function discoverAndStartDirectMiner(page, address) {
       ok: true,
       job: {jobId:job.jobId,targetHi:job.targetHi,targetLo:job.targetLo}
     };
-  }, address);
+  }, { address, externalCaptured });
 }
 
 async function webgpuInfo(page) {
@@ -429,6 +445,26 @@ async function main() {
   page.on('console',msg=>{const t=msg.text();if(/hash|mine|hunt|gpu|webgpu|nonce|difficulty|keccak|error|mint|wallet/i.test(t))console.log('[PAGE] '+t)});
   page.on('pageerror',e=>console.log('[PAGEERROR] '+e.message));
 
+
+  const externalNetwork = [];
+  page.on('response', async (response) => {
+    try {
+      const url = response.url();
+      if (!/purrcat|hunt|job|mine|anchor|api/i.test(url)) return;
+      const headers = response.headers();
+      const ct = headers['content-type'] || '';
+      if (!/json|text|javascript/i.test(ct)) return;
+      const text = await response.text();
+      if (!text || text.length > 3000000) return;
+
+      if (/anchorHash|nonceHigh|targetHi|targetLo|target|jobId|difficulty/i.test(text)) {
+        externalNetwork.push({url, status:response.status(), text});
+        if (externalNetwork.length > 100) externalNetwork.shift();
+        console.log('[NET] candidate payload: '+url+' ('+text.length+' bytes)');
+      }
+    } catch {}
+  });
+
   await page.exposeFunction('__purrcat_rpc', async (method, params) => {
     if(method==='eth_chainId')return CHAIN_HEX;
     if(method==='net_version')return String(CHAIN_ID);
@@ -483,13 +519,14 @@ async function main() {
   async function tryDirectStart() {
     if (!address || directStarted) return;
     try {
-      const direct = await discoverAndStartDirectMiner(page, address);
+      const direct = await discoverAndStartDirectMiner(page, address, externalNetwork);
       if (direct.ok) {
         directStarted = true;
         console.log('[DIRECT] PurrCat WebGPU miner is running.');
         console.log('[DIRECT] Job: ' + JSON.stringify(direct.job));
       } else {
         console.log('[DIRECT] job not ready yet: ' + direct.reason);
+        if (direct.captured?.length) console.log('[NET] Captured: ' + JSON.stringify(direct.captured.slice(-8)));
       }
     } catch (e) {
       console.log('[DIRECT] startup error: ' + e.message);
