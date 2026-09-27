@@ -66,27 +66,79 @@ async function rpcCall(method, params) {
   return body.result;
 }
 
-function providerScript() {
+function providerScript(address) {
   return `(() => {
-    const rpc = (method, params) => window.__purrcat_rpc(method, params || []);
+    const account = ${JSON.stringify(address)};
+    const chainId = '0x3e7';
     const listeners = new Map();
+
+    function emit(event, payload) {
+      for (const fn of listeners.get(event) || []) {
+        try { fn(payload); } catch {}
+      }
+    }
+
     const ethereum = {
       isPurrCatCLI: true,
       isMetaMask: true,
-      request({method, params}) { return rpc(method, params || []); },
+      isRabby: true,
+      chainId,
+      selectedAddress: account || null,
+      isConnected: () => true,
+
+      request({method, params}) {
+        if (method === 'eth_chainId') return Promise.resolve(chainId);
+        if (method === 'net_version') return Promise.resolve('999');
+
+        if (method === 'eth_accounts' || method === 'eth_requestAccounts') {
+          if (account) {
+            this.selectedAddress = account;
+            queueMicrotask(() => emit('accountsChanged', [account]));
+          }
+          return Promise.resolve(account ? [account] : []);
+        }
+
+        if (method === 'eth_coinbase') return Promise.resolve(account || null);
+
+        if (method === 'wallet_switchEthereumChain' || method === 'wallet_addEthereumChain') {
+          queueMicrotask(() => emit('chainChanged', chainId));
+          return Promise.resolve(null);
+        }
+
+        if (method === 'wallet_getPermissions') return Promise.resolve([]);
+        if (method === 'wallet_requestPermissions') return Promise.resolve([]);
+
+        return window.__purrcat_rpc(method, params || []);
+      },
+
       on(event, fn) {
         if (!listeners.has(event)) listeners.set(event, []);
         listeners.get(event).push(fn);
         return this;
       },
+
       removeListener(event, fn) {
         listeners.set(event, (listeners.get(event) || []).filter(x => x !== fn));
         return this;
+      },
+
+      removeAllListeners(event) {
+        if (event) listeners.delete(event);
+        else listeners.clear();
+        return this;
       }
     };
+
     window.ethereum = ethereum;
     window.dispatchEvent(new Event('ethereum#initialized'));
-  })();`;
+
+    if (account) {
+      setTimeout(() => {
+        emit('accountsChanged', [account]);
+        emit('chainChanged', chainId);
+      }, 0);
+    }
+  })()`;
 }
 
 
@@ -306,6 +358,63 @@ async function launchGpuBrowser() {
       });
 
       const context = await browser.newContext({viewport:{width:1440,height:900}});
+
+      await context.route(/https:\/\/purrcat\.xyz\/miner\/gpu_miner\.js(?:\\?.*)?$/i, async (route) => {
+        try {
+          const response = await route.fetch();
+          let body = await response.text();
+
+          const exportNeedle = 'export async function createGpuMiner({';
+          const originalNeedle = 'async function createGpuMinerOriginal({';
+
+          if (body.includes(exportNeedle)) {
+            body = body.replace(exportNeedle, originalNeedle);
+
+            const wrapper = [
+              '',
+              '// CLI instrumentation wrapper',
+              'export async function createGpuMiner(args = {}) {',
+              '  const originalProgress = args.onProgress;',
+              '  const originalFound = args.onFound;',
+              '  const miner = await createGpuMinerOriginal({',
+              '    ...args,',
+              '    onProgress(count) {',
+              '      window.__purrcatHashCount = (window.__purrcatHashCount || 0) + Number(count || 0);',
+              '      if (originalProgress) originalProgress(count);',
+              '    },',
+              '    onFound(hit) {',
+              '      window.__purrcatFound = hit;',
+              '      if (originalFound) originalFound(hit);',
+              '    },',
+              '    onError(error) {',
+              '      window.__purrcatMinerError = String(error?.message || error);',
+              '      if (args.onError) args.onError(error);',
+              '    }',
+              '  });',
+              '  const originalSetJob = miner.setJob.bind(miner);',
+              '  miner.setJob = (job) => {',
+              '    window.__purrcatJob = {',
+              '      jobId: job?.jobId ?? null,',
+              '      targetHi: job?.targetHi ?? null,',
+              '      targetLo: job?.targetLo ?? null',
+              '    };',
+              '    return originalSetJob(job);',
+              '  };',
+              '  window.__purrcatGpuMiner = miner;',
+              '  return miner;',
+              '}',
+              ''
+            ].join('\\n');
+
+            body += wrapper;
+          }
+
+          await route.fulfill({response, body});
+        } catch (error) {
+          await route.abort('failed');
+        }
+      });
+
       const page = await context.newPage();
       await page.goto(SITE,{waitUntil:'domcontentloaded',timeout:120000});
 
@@ -456,8 +565,6 @@ async function main() {
   const {browser,context,page,gpu,profile}=launched;
 
   await context.addInitScript({content:providerScript()});
-  await context.addInitScript({content:gpuTelemetryScript()});
-  await installNetworkCapture(page);
 
   // Re-load after the provider has been installed.
   page.on('console',msg=>{const t=msg.text();if(/hash|mine|hunt|gpu|webgpu|nonce|difficulty|keccak|error|mint|wallet/i.test(t))console.log('[PAGE] '+t)});
@@ -508,11 +615,80 @@ async function main() {
     if(method==='eth_getTransactionByHash')return rpc.send('eth_getTransactionByHash',params||[]);
     if(method==='eth_getTransactionReceipt')return rpc.send('eth_getTransactionReceipt',params||[]);
     if(method==='web3_clientVersion')return rpc.send('web3_clientVersion',params||[]);
+    if(method==='eth_sendTransaction'){
+      if(!privateKey)throw new Error('No PURRCAT_PRIVATE_KEY configured.');
+      if(process.env.PURRCAT_AUTO_SUBMIT !== '1')throw new Error('Transaction blocked. Set PURRCAT_AUTO_SUBMIT=1.');
+
+      const t={...(params?.[0]||{})};
+      delete t.from;
+      if(t.gas){t.gasLimit=BigInt(t.gas);delete t.gas;}
+
+      const balance=await rpc.getBalance(address);
+      const estimate=await rpc.estimateGas(t);
+      const fee=await rpc.getFeeData();
+      const gasPrice=fee.maxFeePerGas||fee.gasPrice||0n;
+      const value=BigInt(t.value||0);
+      const worst=value+estimate*gasPrice;
+
+      console.log('[TX] value '+ethers.formatEther(value)+' HYPE | max '+ethers.formatEther(worst)+' HYPE');
+
+      if(balance<worst)throw new Error('Insufficient HYPE for transaction plus gas.');
+
+      const wallet=new ethers.Wallet(privateKey,rpc);
+      const sent=await wallet.sendTransaction(t);
+      console.log('[TX SENT] '+sent.hash);
+      return sent.hash;
+    }
+
+    if(method==='personal_sign'){
+      if(!privateKey)throw new Error('No PURRCAT_PRIVATE_KEY configured.');
+      if(process.env.PURRCAT_AUTO_SUBMIT !== '1')throw new Error('Signing blocked. Set PURRCAT_AUTO_SUBMIT=1.');
+      const wallet=new ethers.Wallet(privateKey,rpc);
+      const message=params?.[0]||'0x';
+      return wallet.signMessage(ethers.getBytes(message));
+    }
+
+    if(method==='eth_sign'){
+      if(!privateKey)throw new Error('No PURRCAT_PRIVATE_KEY configured.');
+      if(process.env.PURRCAT_AUTO_SUBMIT !== '1')throw new Error('Signing blocked. Set PURRCAT_AUTO_SUBMIT=1.');
+      const wallet=new ethers.Wallet(privateKey,rpc);
+      return wallet.signMessage(ethers.getBytes(params?.[1]||'0x'));
+    }
+
+    if(method==='eth_signTypedData_v4'||method==='eth_signTypedData'){
+      if(!privateKey)throw new Error('No PURRCAT_PRIVATE_KEY configured.');
+      if(process.env.PURRCAT_AUTO_SUBMIT !== '1')throw new Error('Signing blocked. Set PURRCAT_AUTO_SUBMIT=1.');
+      const wallet=new ethers.Wallet(privateKey,rpc);
+      const p=params||[];
+      const typed=typeof p[p.length-1]==='string'?JSON.parse(p[p.length-1]):p[p.length-1];
+      const types={...(typed?.types||{})};
+      delete types.EIP712Domain;
+      return wallet.signTypedData(typed?.domain||{},types,typed?.message||{});
+    }
+
+    if(method==='eth_sendRawTransaction'){
+      if(!privateKey)throw new Error('No PURRCAT_PRIVATE_KEY configured.');
+      if(process.env.PURRCAT_AUTO_SUBMIT !== '1')throw new Error('Transaction blocked. Set PURRCAT_AUTO_SUBMIT=1.');
+      return rpc.send(method,params||[]);
+    }
+
     if(method.startsWith('net_')||method.startsWith('web3_')||method.startsWith('eth_'))return rpc.send(method,params||[]);
     throw new Error('Unsupported RPC method: '+method);
   });
 
   await page.reload({waitUntil:'domcontentloaded',timeout:120000});
+
+  if (address) {
+    await page.evaluate(async () => {
+      try {
+        if (window.ethereum) {
+          await window.ethereum.request({method:'eth_requestAccounts'});
+        }
+      } catch (e) {
+        console.log('[WALLET] request failed: ' + e.message);
+      }
+    }).catch(()=>{});
+  }
 
   await page.waitForTimeout(4000);
 
@@ -589,26 +765,28 @@ async function main() {
         }
       }
 
-      if (directStarted) {
-        const snapshot = await page.evaluate(() => ({
-          total: Number(window.__purrcatProgress || 0),
-          found: window.__purrcatFound || null,
-          error: window.__purrcatMinerError || null,
-          job: window.__purrcatDirectJob?.jobId || null
-        })).catch(() => null);
+      const snapshot = await page.evaluate(() => ({
+        total: Number(window.__purrcatHashCount || 0),
+        found: window.__purrcatFound || null,
+        error: window.__purrcatMinerError || null,
+        job: window.__purrcatJob || null,
+        miner: !!window.__purrcatGpuMiner
+      })).catch(() => null);
 
-        if (snapshot) {
-          const now = Date.now();
-          const delta = Math.max(0, snapshot.total - progressBase);
-          const rate = Math.round(delta / Math.max(0.001, (now - progressAt) / 1000));
-          progressBase = snapshot.total;
-          progressAt = now;
+      if (snapshot) {
+        const now = Date.now();
+        const delta = Math.max(0, snapshot.total - progressBase);
+        const rate = Math.round(delta / Math.max(0.001, (now - progressAt) / 1000));
+        progressBase = snapshot.total;
+        progressAt = now;
 
-          console.log('[HASHRATE] '+rate.toLocaleString()+' H/s | job='+(snapshot.job || 'unknown'));
+        console.log('[HASHRATE] '+rate.toLocaleString()+' H/s | GPU miner '+(snapshot.miner ? 'ready' : 'not created'));
 
-          if (snapshot.found) console.log('[FOUND] '+JSON.stringify(snapshot.found));
-          if (snapshot.error) console.log('[MINER ERROR] '+snapshot.error);
-        }
+        if (snapshot.job) console.log('[JOB] '+JSON.stringify(snapshot.job));
+        else console.log('[JOB] waiting for PurrCat client to assign mining job');
+
+        if (snapshot.found) console.log('[FOUND] '+JSON.stringify(snapshot.found));
+        if (snapshot.error) console.log('[MINER ERROR] '+snapshot.error);
       }
 
       showGpu();
