@@ -359,7 +359,7 @@ async function launchGpuBrowser() {
 
       const context = await browser.newContext({viewport:{width:1440,height:900}});
 
-      await context.route(/https:\/\/purrcat\.xyz\/miner\/gpu_miner\.js(?:\\?.*)?$/i, async (route) => {
+      await context.route(/https:\/\/purrcat\.xyz\/miner\/gpu_miner\.js(?:\?.*)?$/i, async (route) => {
         try {
           const response = await route.fetch();
           let body = await response.text();
