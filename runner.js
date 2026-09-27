@@ -92,7 +92,7 @@ function providerScript() {
 
 async function installNetworkCapture(page) {
   await page.addInitScript({
-    content: String.raw\`
+    content: `
 (() => {
   const captured = [];
   const MAX = 2000000;
