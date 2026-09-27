@@ -215,6 +215,68 @@ async function clickStart(page) {
   return false;
 }
 
+
+function gpuTelemetryScript() {
+  return \`
+(() => {
+  const state = {
+    attempts: 0,
+    workgroups: 0,
+    lastDispatchMs: 0,
+    patched: false
+  };
+
+  window.__purrcatGpuTelemetry = state;
+
+  const KEY = '__purrcatDispatchWrapped_v1';
+
+  function patch() {
+    try {
+      const proto = globalThis.GPUComputePassEncoder &&
+        globalThis.GPUComputePassEncoder.prototype;
+
+      if (!proto || typeof proto.dispatchWorkgroups !== 'function') return;
+      if (proto[KEY]) {
+        state.patched = true;
+        return;
+      }
+
+      const original = proto.dispatchWorkgroups;
+
+      function wrapped(x = 1, y = 1, z = 1) {
+        const groups = Math.max(1, Number(x) || 1) *
+          Math.max(1, Number(y) || 1) *
+          Math.max(1, Number(z) || 1);
+
+        state.workgroups += groups;
+        state.attempts += groups * 256;
+        state.lastDispatchMs = performance.now();
+
+        return original.call(this, x, y, z);
+      }
+
+      Object.defineProperty(wrapped, KEY, { value: true });
+
+      try {
+        Object.defineProperty(proto, 'dispatchWorkgroups', {
+          configurable: true,
+          writable: true,
+          value: wrapped
+        });
+      } catch {
+        proto.dispatchWorkgroups = wrapped;
+      }
+
+      state.patched = proto.dispatchWorkgroups === wrapped;
+    } catch {}
+  }
+
+  patch();
+  setInterval(patch, 50);
+})();
+  \`;
+}
+
 async function main() {
   console.log('==============================================');
   console.log('          PURRCAT UNIVERSAL GPU RUNTIME');
@@ -249,6 +311,7 @@ async function main() {
   const {browser,context,page,gpu,profile}=launched;
 
   await context.addInitScript({content:providerScript()});
+  await context.addInitScript({content:gpuTelemetryScript()});
 
   // Re-load after the provider has been installed.
   page.on('console',msg=>{const t=msg.text();if(/hash|mine|hunt|gpu|webgpu|nonce|difficulty|keccak|error|mint|wallet/i.test(t))console.log('[PAGE] '+t)});
@@ -310,6 +373,32 @@ async function main() {
       const lines=text.split(/\n/).map(s=>s.trim()).filter(Boolean).filter(s=>/hashrate|H\/s|KH\/s|MH\/s|GH\/s|difficulty|expected|streak|found|won|mint|anchor|nonce|error/i.test(s)).slice(0,20);
       console.log('\n[STATS] uptime='+Math.floor((Date.now()-startedAt)/1000)+'s');
       if(lines.length)console.log(lines.join(' | '));
+      const telemetry = await page.evaluate(() => {
+        const t = window.__purrcatGpuTelemetry;
+        if (!t) return null;
+        return {
+          attempts: t.attempts,
+          workgroups: t.workgroups,
+          patched: t.patched,
+          lastDispatchMs: t.lastDispatchMs
+        };
+      }).catch(() => null);
+
+      if (telemetry) {
+        const nowAttempts = Number(telemetry.attempts || 0);
+        const previousAttempts = Number(page.__purrcatLastAttempts || 0);
+        const elapsedSec = Math.max(0.001, (Date.now() - Number(page.__purrcatLastSample || Date.now())) / 1000);
+        const rate = Math.max(0, Math.round((nowAttempts - previousAttempts) / elapsedSec));
+        page.__purrcatLastAttempts = nowAttempts;
+        page.__purrcatLastSample = Date.now();
+
+        console.log('[HASHRATE] ' + rate.toLocaleString() + ' H/s | dispatch wrapper ' + (telemetry.patched ? 'active' : 'inactive'));
+
+        if (rate === 0 && telemetry.patched) {
+          console.log('[HASHRATE] No GPU compute dispatches observed in the last interval.');
+        }
+      }
+
       showGpu();
     }catch(e){console.log('[STATS ERROR] '+e.message);}
   },STATS_MS);
