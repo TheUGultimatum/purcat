@@ -564,7 +564,7 @@ async function main() {
   const launched=await launchGpuBrowser();
   const {browser,context,page,gpu,profile}=launched;
 
-  await context.addInitScript({content:providerScript()});
+  await context.addInitScript({content:providerScript(address)});
 
   // Re-load after the provider has been installed.
   page.on('console',msg=>{const t=msg.text();if(/hash|mine|hunt|gpu|webgpu|nonce|difficulty|keccak|error|mint|wallet/i.test(t))console.log('[PAGE] '+t)});
