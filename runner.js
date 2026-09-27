@@ -89,6 +89,117 @@ function providerScript() {
   })();`;
 }
 
+
+async function installNetworkCapture(page) {
+  await page.addInitScript({
+    content: String.raw\`
+(() => {
+  const captured = [];
+  const MAX = 2000000;
+  window.__purrcatNetwork = captured;
+
+  function save(url, status, text) {
+    try {
+      if (!text || text.length > MAX) return;
+      if (/anchorHash|nonceHigh|targetHi|targetLo|difficulty|jobId|domain|contract/i.test(text)) {
+        captured.push({url, status, text});
+        if (captured.length > 80) captured.shift();
+      }
+    } catch {}
+  }
+
+  const originalFetch = window.fetch;
+  window.fetch = async function(...args) {
+    const response = await originalFetch.apply(this, args);
+    try {
+      const clone = response.clone();
+      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+      clone.text().then(text => save(url, response.status, text)).catch(() => {});
+    } catch {}
+    return response;
+  };
+
+  const OriginalXHR = window.XMLHttpRequest;
+  window.XMLHttpRequest = function() {
+    const xhr = new OriginalXHR();
+    xhr.addEventListener('load', function() {
+      try { save(this.responseURL || '', this.status, String(this.responseText || '')); } catch {}
+    });
+    return xhr;
+  };
+  window.XMLHttpRequest.prototype = OriginalXHR.prototype;
+})();
+\`
+  });
+}
+
+async function discoverAndStartDirectMiner(page, address) {
+  return page.evaluate(async (address) => {
+    const captured = window.__purrcatNetwork || [];
+    const candidates = [];
+
+    function walk(v) {
+      if (!v || typeof v !== 'object' || candidates.length > 50) return;
+      if (v.anchorHash && v.nonceHigh && v.targetHi !== undefined && v.targetLo !== undefined) {
+        candidates.push(v);
+      }
+      if (Array.isArray(v)) for (const x of v) walk(x);
+      else for (const x of Object.values(v)) walk(x);
+    }
+
+    for (const entry of captured) {
+      try { walk(JSON.parse(entry.text)); } catch {}
+    }
+
+    if (!candidates.length) {
+      return {
+        ok: false,
+        reason: 'No complete mining job found',
+        captured: captured.map(x => ({url:x.url,status:x.status,bytes:x.text?.length||0}))
+      };
+    }
+
+    const raw = candidates[candidates.length - 1];
+    const gpuMod = await import(new URL('/miner/gpu_miner.js?cli='+Date.now(), location.origin).href);
+    const keccak = await import(new URL('/miner/keccak_core.js?cli='+Date.now(), location.origin).href);
+
+    const targetHi = Number(BigInt(String(raw.targetHi)) & 0xffffffffn) >>> 0;
+    const targetLo = Number(BigInt(String(raw.targetLo)) & 0xffffffffn) >>> 0;
+
+    const job = {
+      jobId: String(raw.jobId ?? raw.id ?? Date.now()),
+      prep: keccak.prepare({
+        domain: raw.domain,
+        chainId: raw.chainId ?? 999,
+        contract: raw.contract,
+        anchorHash: raw.anchorHash,
+        miner: raw.miner ?? address,
+        nonceHigh: raw.nonceHigh
+      }),
+      targetHi,
+      targetLo
+    };
+
+    const miner = await gpuMod.createGpuMiner({
+      onProgress: count => {
+        window.__purrcatProgress = (window.__purrcatProgress || 0) + Number(count || 0);
+        window.__purrcatLastProgressAt = performance.now();
+      },
+      onFound: hit => { window.__purrcatFound = hit; },
+      onError: error => { window.__purrcatMinerError = String(error?.message || error); }
+    });
+
+    miner.setJob(job);
+    window.__purrcatDirectMiner = miner;
+    window.__purrcatDirectJob = job;
+
+    return {
+      ok: true,
+      job: {jobId:job.jobId,targetHi:job.targetHi,targetLo:job.targetLo}
+    };
+  }, address);
+}
+
 async function webgpuInfo(page) {
   return page.evaluate(async()=>{
     if(!navigator.gpu)return {available:false,adapter:null};
@@ -364,6 +475,25 @@ async function main() {
   }
 
   console.log('[RUN] WebGPU profile '+profile+' active on '+gpu.adapter.vendor+' '+(gpu.adapter.architecture||''));
+  let directStarted = false;
+  let progressBase = 0;
+  let progressAt = Date.now();
+
+  if (address) {
+    try {
+      const direct = await discoverAndStartDirectMiner(page, address);
+      console.log('[DIRECT] ' + JSON.stringify(direct));
+      if (direct.ok) {
+        directStarted = true;
+        console.log('[DIRECT] PurrCat WebGPU miner is running.');
+      } else {
+        console.log('[DIRECT] Waiting for a complete mining job from the site API...');
+      }
+    } catch (e) {
+      console.log('[DIRECT] startup error: ' + e.message);
+    }
+  }
+
   console.log('[RUN] Watching PurrCat client and GPU.');
 
   const startedAt=Date.now();
@@ -396,6 +526,28 @@ async function main() {
 
         if (rate === 0 && telemetry.patched) {
           console.log('[HASHRATE] No GPU compute dispatches observed in the last interval.');
+        }
+      }
+
+      if (directStarted) {
+        const snapshot = await page.evaluate(() => ({
+          total: Number(window.__purrcatProgress || 0),
+          found: window.__purrcatFound || null,
+          error: window.__purrcatMinerError || null,
+          job: window.__purrcatDirectJob?.jobId || null
+        })).catch(() => null);
+
+        if (snapshot) {
+          const now = Date.now();
+          const delta = Math.max(0, snapshot.total - progressBase);
+          const rate = Math.round(delta / Math.max(0.001, (now - progressAt) / 1000));
+          progressBase = snapshot.total;
+          progressAt = now;
+
+          console.log('[HASHRATE] '+rate.toLocaleString()+' H/s | job='+(snapshot.job || 'unknown'));
+
+          if (snapshot.found) console.log('[FOUND] '+JSON.stringify(snapshot.found));
+          if (snapshot.error) console.log('[MINER ERROR] '+snapshot.error);
         }
       }
 
