@@ -217,7 +217,7 @@ async function clickStart(page) {
 
 
 function gpuTelemetryScript() {
-  return \`
+  return `
 (() => {
   const state = {
     attempts: 0,
@@ -274,7 +274,7 @@ function gpuTelemetryScript() {
   patch();
   setInterval(patch, 50);
 })();
-  \`;
+  `;
 }
 
 async function main() {
