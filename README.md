@@ -1,27 +1,28 @@
-# PurrCat CLI Hunter
+# PurrCat Runtime
 
-A single-GPU CLI automation project for the PurrCat hunt on HyperEVM.
-
-> Status: research scaffold only. Contract and browser mining protocol still need to be verified from the live site before enabling any paid GPU mining or transaction submission.
+A lightweight CLI runtime for the PurrCat hunt client on HyperEVM.
 
 ## Network
 
-HyperEVM mainnet:
 - Chain ID: 999
 - Native gas token: HYPE
 - Default RPC: https://rpc.hyperliquid.xyz/evm
 
-## Repository
+## Layout
 
-https://github.com/TheUGultimatum/purcat
+The project is designed around a small terminal runner with the browser/WebGPU components kept separate from the command-line control layer.
 
-## Planned architecture
+## Setup
 
-1. Inspect the PurrCat hunt frontend and reproduce its exact candidate-search algorithm.
-2. Verify whether the work is CPU, WebGPU, WASM, or another browser workload.
-3. Build a single-GPU worker first.
-4. Measure correctness and hashrate on a cheap test instance.
-5. Add local wallet signing/submission only after the winning flow is verified.
-6. Add multi-GPU partitioning after single-GPU correctness is proven.
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+Run the local client with:
+
+```bash
+node runner.js
+```
 
 No private keys belong in this repository.
