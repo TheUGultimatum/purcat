@@ -1,6 +1,6 @@
 {
   "name": "purrcat-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "commonjs",
   "main": "runner.js",
@@ -10,6 +10,7 @@
     "check": "node --check runner.js"
   },
   "dependencies": {
+    "ethers": "^6.15.0",
     "playwright": "^1.55.0"
   }
 }
