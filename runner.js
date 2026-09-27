@@ -3,15 +3,21 @@
 
 const { spawn, spawnSync } = require('node:child_process');
 const { chromium } = require('playwright');
+const { ethers } = require('ethers');
 
 const SITE = process.env.PURRCAT_SITE || 'https://purrcat.xyz/#hunt';
+const RPC_URL = process.env.PURRCAT_RPC_URL || 'https://rpc.hyperliquid.xyz/evm';
+const CHAIN_ID = 999;
+const CHAIN_HEX = '0x3e7';
 const DISPLAY = process.env.DISPLAY || ':99';
 const HEADLESS = process.env.PURRCAT_HEADLESS === '1';
 const AUTO_START = process.env.PURRCAT_AUTO_START !== '0';
 const STATS_MS = Math.max(1000, Number(process.env.PURRCAT_STATS_INTERVAL || '5000'));
-const ADDRESS = process.env.PURRCAT_ADDRESS || '';
 
-function die(s) { console.error('\nERROR:', s); process.exit(1); }
+function die(s) {
+  console.error('\nERROR:', s);
+  process.exit(1);
+}
 
 function exec(command, args) {
   return spawnSync(command, args, { encoding:'utf8', stdio:['ignore','pipe','pipe'] });
@@ -48,8 +54,39 @@ function startXvfb() {
   return p;
 }
 
-function providerScript(address) {
-  return '(()=>{const account='+JSON.stringify(address)+',chainId="0x3e7",listeners=new Map();const ethereum={isPurrCatCLI:true,isMetaMask:true,chainId,selectedAddress:account||null,request({method}){if(method==="eth_chainId")return Promise.resolve(chainId);if(method==="net_version")return Promise.resolve("999");if(method==="eth_accounts"||method==="eth_requestAccounts")return Promise.resolve(account?[account]:[]);if(method==="eth_coinbase")return Promise.resolve(account||null);if(method==="wallet_switchEthereumChain"||method==="wallet_addEthereumChain")return Promise.resolve(null);if(method==="wallet_getPermissions")return Promise.resolve([]);throw new Error("CLI provider method not implemented: "+method)},on(event,fn){if(!listeners.has(event))listeners.set(event,[]);listeners.get(event).push(fn);return this},removeListener(event,fn){listeners.set(event,(listeners.get(event)||[]).filter(x=>x!==fn));return this}};window.ethereum=ethereum;window.dispatchEvent(new Event("ethereum#initialized"));})();';
+async function rpcCall(method, params) {
+  const res = await fetch(RPC_URL, {
+    method:'POST',
+    headers:{'content-type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:1,method,params:params||[]})
+  });
+  if (!res.ok) throw new Error('RPC HTTP '+res.status);
+  const body = await res.json();
+  if (body.error) throw new Error(body.error.message || JSON.stringify(body.error));
+  return body.result;
+}
+
+function providerScript() {
+  return `(() => {
+    const rpc = (method, params) => window.__purrcat_rpc(method, params || []);
+    const listeners = new Map();
+    const ethereum = {
+      isPurrCatCLI: true,
+      isMetaMask: true,
+      request({method, params}) { return rpc(method, params || []); },
+      on(event, fn) {
+        if (!listeners.has(event)) listeners.set(event, []);
+        listeners.get(event).push(fn);
+        return this;
+      },
+      removeListener(event, fn) {
+        listeners.set(event, (listeners.get(event) || []).filter(x => x !== fn));
+        return this;
+      }
+    };
+    window.ethereum = ethereum;
+    window.dispatchEvent(new Event('ethereum#initialized'));
+  })();`;
 }
 
 async function webgpuInfo(page) {
@@ -57,7 +94,12 @@ async function webgpuInfo(page) {
     if(!navigator.gpu)return {available:false,adapter:null};
     const a=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
     if(!a)return {available:true,adapter:null};
-    return {available:true,adapter:{vendor:a.info?.vendor||null,architecture:a.info?.architecture||null,device:a.info?.device||null,description:a.info?.description||null}};
+    return {available:true,adapter:{
+      vendor:a.info?.vendor||null,
+      architecture:a.info?.architecture||null,
+      device:a.info?.device||null,
+      description:a.info?.description||null
+    }};
   });
 }
 
@@ -66,8 +108,83 @@ function hardwareAdapter(info) {
   return /nvidia|geforce|10de/.test(s)&&!/swiftshader|llvmpipe|software/.test(s);
 }
 
+function chromiumProfiles() {
+  const common = [
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
+    '--enable-gpu',
+    '--ignore-gpu-blocklist',
+    '--disable-software-rasterizer',
+    '--force_high_performance_gpu',
+    '--use-webgpu-power-preference=high-performance',
+    '--enable-unsafe-webgpu',
+    '--window-size=1440,900'
+  ];
+
+  return [
+    [
+      ...common,
+      '--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan,UseOzonePlatform',
+      '--use-gl=angle',
+      '--use-angle=vulkan',
+      '--disable-vulkan-surface'
+    ],
+    [
+      ...common,
+      '--enable-features=UseOzonePlatform',
+      '--use-gl=angle',
+      '--use-angle=gl'
+    ],
+    [
+      ...common,
+      '--enable-features=UseOzonePlatform',
+      '--use-gl=egl'
+    ]
+  ];
+}
+
+async function launchGpuBrowser() {
+  const profiles = chromiumProfiles();
+
+  for (let i=0;i<profiles.length;i++) {
+    let browser;
+    try {
+      console.log('[GPU] Trying Chromium GPU profile '+(i+1)+'/'+profiles.length);
+      browser = await chromium.launch({
+        headless: HEADLESS,
+        executablePath: chromium.executablePath(),
+        args:[
+          ...profiles[i],
+          ...(HEADLESS ? [] : ['--ozone-platform=x11'])
+        ],
+        env:{...process.env,DISPLAY:process.env.DISPLAY||DISPLAY}
+      });
+
+      const context = await browser.newContext({viewport:{width:1440,height:900}});
+      const page = await context.newPage();
+      await page.goto(SITE,{waitUntil:'domcontentloaded',timeout:120000});
+
+      const gpu = await webgpuInfo(page);
+      console.log('[WEBGPU] profile '+(i+1)+': '+JSON.stringify(gpu));
+
+      if (gpu.available && gpu.adapter && hardwareAdapter(gpu.adapter)) {
+        return {browser,context,page,gpu,profile:i+1};
+      }
+
+      await context.close().catch(()=>{});
+      await browser.close().catch(()=>{});
+    } catch (e) {
+      console.log('[GPU] profile '+(i+1)+' failed: '+e.message);
+      if (browser) await browser.close().catch(()=>{});
+    }
+  }
+
+  die('No Chromium profile produced a hardware NVIDIA WebGPU adapter.');
+}
+
 async function clickConnect(page) {
-  const buttons=page.locator('button'); const n=await buttons.count();
+  const buttons=page.locator('button');
+  const n=await buttons.count();
   for(let i=0;i<n;i++){
     const b=buttons.nth(i);
     if(!(await b.isVisible().catch(()=>false)))continue;
@@ -83,7 +200,8 @@ async function clickConnect(page) {
 
 async function clickStart(page) {
   const pattern=/start mining|start hunt|begin hunt|hunt|mine/i;
-  const buttons=page.locator('button'); const n=await buttons.count();
+  const buttons=page.locator('button');
+  const n=await buttons.count();
   for(let i=0;i<n;i++){
     const b=buttons.nth(i);
     if(!(await b.isVisible().catch(()=>false)))continue;
@@ -99,66 +217,97 @@ async function clickStart(page) {
 
 async function main() {
   console.log('==============================================');
-  console.log('           PURRCAT CLI RUNTIME');
+  console.log('          PURRCAT UNIVERSAL GPU RUNTIME');
   console.log('==============================================');
-
-  if(!ADDRESS) console.log('[WALLET] PURRCAT_ADDRESS not set.');
-  else console.log('[WALLET] '+ADDRESS);
-  if(ADDRESS && !/^0x[0-9a-fA-F]{40}$/.test(ADDRESS)) die('PURRCAT_ADDRESS is not a valid EVM address.');
 
   const gpus=showGpu();
   if(!gpus.length)die('No NVIDIA GPU detected.');
 
+  const privateKey = process.env.PURRCAT_PRIVATE_KEY || '';
+  let address = process.env.PURRCAT_ADDRESS || '';
+
+  if (privateKey) {
+    if(!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) die('PURRCAT_PRIVATE_KEY format is invalid.');
+    address = new ethers.Wallet(privateKey).address;
+    console.log('[WALLET] address derived from supplied private key: '+address);
+  } else if(address) {
+    if(!/^0x[0-9a-fA-F]{40}$/.test(address)) die('PURRCAT_ADDRESS is not a valid EVM address.');
+    console.log('[WALLET] address: '+address);
+  } else {
+    console.log('[WALLET] No key/address supplied. Client may remain disconnected.');
+  }
+
+  const rpc = new ethers.JsonRpcProvider(RPC_URL, CHAIN_ID, {staticNetwork:true});
+  const network = await rpc.getNetwork();
+  if(Number(network.chainId)!==CHAIN_ID)die('Wrong HyperEVM RPC chain id: '+network.chainId);
+  if(address){
+    console.log('[WALLET] HYPE balance: '+ethers.formatEther(await rpc.getBalance(address)));
+  }
+
   const xvfb=HEADLESS?null:startXvfb();
+  const launched=await launchGpuBrowser();
+  const {browser,context,page,gpu,profile}=launched;
 
-  const browser=await chromium.launch({
-    headless:HEADLESS,
-    executablePath:chromium.executablePath(),
-    args:[
-      '--no-sandbox','--disable-dev-shm-usage','--enable-gpu','--ignore-gpu-blocklist',
-      '--disable-software-rasterizer','--force_high_performance_gpu',
-      '--use-webgpu-power-preference=high-performance','--enable-unsafe-webgpu',
-      '--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan,UseOzonePlatform',
-      '--use-angle=vulkan','--use-gl=angle','--disable-vulkan-surface',
-      ...(HEADLESS?[]:['--ozone-platform=x11']),
-      '--window-size=1440,900'
-    ],
-    env:{...process.env,DISPLAY:process.env.DISPLAY||DISPLAY}
-  });
+  await context.addInitScript({content:providerScript()});
 
-  const context=await browser.newContext({viewport:{width:1440,height:900}});
-  if(ADDRESS)await context.addInitScript({content:providerScript(ADDRESS)});
-
-  const page=await context.newPage();
+  // Re-load after the provider has been installed.
   page.on('console',msg=>{const t=msg.text();if(/hash|mine|hunt|gpu|webgpu|nonce|difficulty|keccak|error|mint|wallet/i.test(t))console.log('[PAGE] '+t)});
   page.on('pageerror',e=>console.log('[PAGEERROR] '+e.message));
 
-  await page.goto(SITE,{waitUntil:'domcontentloaded',timeout:120000});
+  await page.exposeFunction('__purrcat_rpc', async (method, params) => {
+    if(method==='eth_chainId')return CHAIN_HEX;
+    if(method==='net_version')return String(CHAIN_ID);
+    if(method==='eth_accounts'||method==='eth_requestAccounts')return address?[address]:[];
+    if(method==='eth_coinbase')return address||null;
+    if(method==='wallet_switchEthereumChain'||method==='wallet_addEthereumChain')return null;
+    if(method==='eth_getBalance')return rpc.getBalance(params?.[0]||address,params?.[1]||'latest').then(x=>'0x'+x.toString(16));
+    if(method==='eth_blockNumber')return rpc.getBlockNumber().then(x=>'0x'+x.toString(16));
+    if(method==='eth_gasPrice')return rpc.getFeeData().then(x=>x.gasPrice?'0x'+x.gasPrice.toString(16):'0x0');
+    if(method==='eth_getCode')return rpc.getCode(params?.[0],params?.[1]||'latest');
+    if(method==='eth_getTransactionCount')return rpc.getTransactionCount(params?.[0]||address,params?.[1]||'latest').then(x=>'0x'+x.toString(16));
+    if(method==='eth_estimateGas'){
+      const t=params?.[0]||{};
+      return rpc.estimateGas({from:t.from,to:t.to,data:t.data,value:t.value}).then(x=>'0x'+x.toString(16));
+    }
+    if(method==='eth_call'){
+      const t=params?.[0]||{};
+      return rpc.call({from:t.from,to:t.to,data:t.data,value:t.value},params?.[1]||'latest');
+    }
+    if(method==='eth_getLogs')return rpc.send('eth_getLogs',params||[]);
+    if(method==='eth_feeHistory')return rpc.send('eth_feeHistory',params||[]);
+    if(method==='eth_getBlockByNumber')return rpc.send('eth_getBlockByNumber',params||[]);
+    if(method==='eth_getTransactionByHash')return rpc.send('eth_getTransactionByHash',params||[]);
+    if(method==='eth_getTransactionReceipt')return rpc.send('eth_getTransactionReceipt',params||[]);
+    if(method==='web3_clientVersion')return rpc.send('web3_clientVersion',params||[]);
+    if(method.startsWith('net_')||method.startsWith('web3_')||method.startsWith('eth_'))return rpc.send(method,params||[]);
+    throw new Error('Unsupported RPC method: '+method);
+  });
 
-  const gpu=await webgpuInfo(page);
-  console.log('[WEBGPU] '+JSON.stringify(gpu));
-  if(!gpu.available||!gpu.adapter)die('WebGPU adapter unavailable.');
-  if(!hardwareAdapter(gpu.adapter))die('WebGPU adapter is not NVIDIA hardware.');
+  await page.reload({waitUntil:'domcontentloaded',timeout:120000});
 
   await page.waitForTimeout(4000);
 
-  if(ADDRESS){await clickConnect(page);await page.waitForTimeout(1500);}
+  if(address){
+    await clickConnect(page);
+    await page.waitForTimeout(1500);
+  }
 
-  const before=await page.locator('body').innerText().catch(()=>'');
-  console.log('[CLIENT] '+before.split(/\n/).map(s=>s.trim()).filter(Boolean).slice(0,12).join(' | '));
+  const body=await page.locator('body').innerText().catch(()=>'');
+  console.log('[CLIENT] '+body.split(/\n/).map(s=>s.trim()).filter(Boolean).slice(0,14).join(' | '));
 
   if(AUTO_START){
     const started=await clickStart(page);
-    if(!started)console.log('[RUN] No explicit start control; waiting for client auto-start.');
+    if(!started)console.log('[RUN] No explicit start control; waiting for the client to auto-start.');
   }
 
-  console.log('[RUN] Runtime active. Watching client + GPU.');
+  console.log('[RUN] WebGPU profile '+profile+' active on '+gpu.adapter.vendor+' '+(gpu.adapter.architecture||''));
+  console.log('[RUN] Watching PurrCat client and GPU.');
 
   const startedAt=Date.now();
   const timer=setInterval(async()=>{
     try{
-      const body=await page.locator('body').innerText().catch(()=>'');
-      const lines=body.split(/\n/).map(s=>s.trim()).filter(Boolean).filter(s=>/hashrate|H\/s|KH\/s|MH\/s|GH\/s|difficulty|expected|streak|found|won|error|mint|anchor|nonce/i.test(s)).slice(0,20);
+      const text=await page.locator('body').innerText().catch(()=>'');
+      const lines=text.split(/\n/).map(s=>s.trim()).filter(Boolean).filter(s=>/hashrate|H\/s|KH\/s|MH\/s|GH\/s|difficulty|expected|streak|found|won|mint|anchor|nonce|error/i.test(s)).slice(0,20);
       console.log('\n[STATS] uptime='+Math.floor((Date.now()-startedAt)/1000)+'s');
       if(lines.length)console.log(lines.join(' | '));
       showGpu();
@@ -166,9 +315,12 @@ async function main() {
   },STATS_MS);
 
   const stop=async()=>{
-    clearInterval(timer);console.log('\nStopping...');
-    await context.close().catch(()=>{});await browser.close().catch(()=>{});
-    if(xvfb)xvfb.kill('SIGTERM');process.exit(0);
+    clearInterval(timer);
+    console.log('\nStopping...');
+    await context.close().catch(()=>{});
+    await browser.close().catch(()=>{});
+    if(xvfb)xvfb.kill('SIGTERM');
+    process.exit(0);
   };
   process.once('SIGINT',stop);process.once('SIGTERM',stop);
   await new Promise(()=>{});
