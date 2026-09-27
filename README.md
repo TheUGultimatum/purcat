@@ -26,3 +26,7 @@ node runner.js
 ```
 
 No private keys belong in this repository.
+
+## Runtime
+
+Use `runner.js` for the terminal GPU runtime.
