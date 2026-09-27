@@ -179,8 +179,26 @@ async function discoverAndStartDirectMiner(page, address, externalCaptured = [])
     const gpuMod = await import(new URL('/miner/gpu_miner.js?cli='+Date.now(), location.origin).href);
     const keccak = await import(new URL('/miner/keccak_core.js?cli='+Date.now(), location.origin).href);
 
-    const targetHi = Number(BigInt(String(raw.targetHi)) & 0xffffffffn) >>> 0;
-    const targetLo = Number(BigInt(String(raw.targetLo)) & 0xffffffffn) >>> 0;
+    let targetBig = null;
+    if (raw.target !== undefined && raw.target !== null) {
+      try { targetBig = BigInt(String(raw.target)); } catch {}
+    }
+
+    const targetHi = raw.targetHi !== undefined
+      ? Number(BigInt(String(raw.targetHi)) & 0xffffffffn) >>> 0
+      : targetBig !== null
+        ? Number((targetBig >> 224n) & 0xffffffffn) >>> 0
+        : null;
+
+    const targetLo = raw.targetLo !== undefined
+      ? Number(BigInt(String(raw.targetLo)) & 0xffffffffn) >>> 0
+      : targetBig !== null
+        ? Number((targetBig >> 192n) & 0xffffffffn) >>> 0
+        : null;
+
+    if (targetHi === null || targetLo === null) {
+      return { ok:false, reason:'Mining job found but targetHi/targetLo could not be derived', rawKeys:Object.keys(raw) };
+    }
 
     const job = {
       jobId: String(raw.jobId ?? raw.id ?? Date.now()),
