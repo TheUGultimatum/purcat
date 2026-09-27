@@ -423,6 +423,7 @@ async function main() {
 
   await context.addInitScript({content:providerScript()});
   await context.addInitScript({content:gpuTelemetryScript()});
+  await installNetworkCapture(page);
 
   // Re-load after the provider has been installed.
   page.on('console',msg=>{const t=msg.text();if(/hash|mine|hunt|gpu|webgpu|nonce|difficulty|keccak|error|mint|wallet/i.test(t))console.log('[PAGE] '+t)});
@@ -479,26 +480,30 @@ async function main() {
   let progressBase = 0;
   let progressAt = Date.now();
 
-  if (address) {
+  async function tryDirectStart() {
+    if (!address || directStarted) return;
     try {
       const direct = await discoverAndStartDirectMiner(page, address);
-      console.log('[DIRECT] ' + JSON.stringify(direct));
       if (direct.ok) {
         directStarted = true;
         console.log('[DIRECT] PurrCat WebGPU miner is running.');
+        console.log('[DIRECT] Job: ' + JSON.stringify(direct.job));
       } else {
-        console.log('[DIRECT] Waiting for a complete mining job from the site API...');
+        console.log('[DIRECT] job not ready yet: ' + direct.reason);
       }
     } catch (e) {
       console.log('[DIRECT] startup error: ' + e.message);
     }
   }
 
+  await tryDirectStart();
+
   console.log('[RUN] Watching PurrCat client and GPU.');
 
   const startedAt=Date.now();
   const timer=setInterval(async()=>{
     try{
+      if (!directStarted) await tryDirectStart();
       const text=await page.locator('body').innerText().catch(()=>'');
       const lines=text.split(/\n/).map(s=>s.trim()).filter(Boolean).filter(s=>/hashrate|H\/s|KH\/s|MH\/s|GH\/s|difficulty|expected|streak|found|won|mint|anchor|nonce|error/i.test(s)).slice(0,20);
       console.log('\n[STATS] uptime='+Math.floor((Date.now()-startedAt)/1000)+'s');
