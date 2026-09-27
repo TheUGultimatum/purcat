@@ -1,0 +1,9 @@
+{
+  "name":"purcat-hunt-cli",
+  "version":"0.1.0",
+  "private":true,
+  "type":"commonjs",
+  "main":"miner.js",
+  "scripts":{"hunt":"node miner.js --hunt","probe":"node miner.js --probe","inspect":"node miner.js --inspect"},
+  "dependencies":{"playwright":"^1.55.0"}
+}
