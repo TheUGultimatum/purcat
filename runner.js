@@ -129,7 +129,7 @@ async function installNetworkCapture(page) {
   };
   window.XMLHttpRequest.prototype = OriginalXHR.prototype;
 })();
-\`
+`
   });
 }
 
